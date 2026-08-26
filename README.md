@@ -91,6 +91,11 @@ kept deliberately for the purpose.
 
 ## Redeploying
 
-The ALB and target group are reused rather than rebuilt, so `app.{domain}` keeps
-pointing at the same load balancer and only the registered target changes. Each
-deploy replaces the previous instance in the target group and re-runs the probes.
+The ALB, target group and certificate are reused rather than rebuilt, so
+`app.{domain}` keeps pointing at the same load balancer and only the registered
+target changes. Each deploy replaces the previous instance in the target group,
+terminates it, and re-runs the probes.
+
+Retiring it is the application's job. enclavize launches one instance per apply
+and hands it over; it has no view on whether a previous one is still wanted, so
+nothing else will stop it. Left alone they accumulate one per commit applied.

@@ -245,11 +245,23 @@ if [ -z "$tg_arn" ] || [ "$tg_arn" = "None" ]; then
     --query 'TargetGroups[0].TargetGroupArn' --output text)"
 fi
 
-# This deploy's instance replaces the last one's.
+# This deploy's instance replaces the last one's, and the last one goes.
+#
+# enclavize launches one instance per apply and hands it over; what becomes of
+# the previous one is the application's call, and nothing else will make it.
+# Left alone they accumulate — one more running instance per commit applied,
+# each still holding the security group this script wants to delete later.
+#
+# A real deployment would drain connections first. There is nothing here worth
+# draining.
 for old in $(aws elbv2 describe-target-health --region "$REGION" --target-group-arn "$tg_arn" \
               --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null); do
-  [ "$old" != "$INSTANCE_ID" ] && aws elbv2 deregister-targets --region "$REGION" \
-    --target-group-arn "$tg_arn" --targets "Id=$old" >/dev/null 2>&1
+  if [ "$old" != "$INSTANCE_ID" ]; then
+    aws elbv2 deregister-targets --region "$REGION" \
+      --target-group-arn "$tg_arn" --targets "Id=$old" >/dev/null 2>&1
+    aws ec2 terminate-instances --region "$REGION" --instance-ids "$old" >/dev/null 2>&1 \
+      && log "retired $old, which this deploy replaces"
+  fi
 done
 aws elbv2 register-targets --region "$REGION" --target-group-arn "$tg_arn" \
   --targets "Id=$INSTANCE_ID" >/dev/null
