@@ -8,8 +8,19 @@ launches an instance, clones this repo at a commit, and runs it.
 What it builds:
 
 ```
-app.{domain}  ->  ALB (:80)  ->  the deploy instance running nginx
+app.{domain}  ->  ALB (:443, its own certificate)  ->  an instance running nginx
+                     :80 redirects to :443
 ```
+
+The certificate is the application's own. enclavize's covers `dashboard.`,
+`proof.` and `apply.` — its names, not this one — so HTTPS here means asking
+ACM for a certificate and writing validation records under `app.{domain}`.
+That is the half of the DNS carve-out that claiming the name does not
+exercise: the boundary has to permit `_hash.app.{domain}` as well as
+`app.{domain}`, while still refusing the three names enclavize keeps.
+
+It is requested once and reused. Asking per deploy would leave a trail of
+certificates and pay the validation wait every time.
 
 What the page shows: the result of **probing the permission boundary from inside
 the sealed account**. Everything else asserted about that boundary is asserted

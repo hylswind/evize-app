@@ -4,10 +4,15 @@
 # setup.sh at the repo root. The deploy state machine launches an instance,
 # clones this repo at a commit, and runs this.
 #
-# This one serves a page, behind an ALB, at app.{domain} — and what the page
-# shows is the result of probing the permission boundary from inside the sealed
-# account. Everything asserted about that boundary elsewhere is asserted against
-# a policy document; this is the only place IAM itself answers.
+# This one serves a page over HTTPS, behind an ALB, at app.{domain} — and what
+# the page shows is the result of probing the permission boundary from inside
+# the sealed account. Everything asserted about that boundary elsewhere is
+# asserted against a policy document; this is the only place IAM itself answers.
+#
+# The certificate is the application's own. enclavize's covers dashboard.,
+# proof. and apply. — its names, not this one — so getting HTTPS at all means
+# writing validation records under app.{domain}, which is the half of the DNS
+# carve-out that claiming the name does not exercise.
 #
 # Every resource created here is tagged evize:app=test so it can be found and
 # deleted afterwards. Route 53 record sets are the exception — AWS only allows
@@ -209,6 +214,8 @@ if [ "$alb_sg" = "None" ] || [ -z "$alb_sg" ]; then
     --query GroupId --output text)"
   aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$alb_sg" \
     --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null
+  aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$alb_sg" \
+    --protocol tcp --port 443 --cidr 0.0.0.0/0 >/dev/null
 fi
 
 app_sg="$(aws ec2 describe-security-groups --region "$REGION" \
@@ -256,9 +263,61 @@ if [ -z "$alb_arn" ] || [ "$alb_arn" = "None" ]; then
     --query 'LoadBalancers[0].LoadBalancerArn' --output text)"
   aws elbv2 create-listener --region "$REGION" --load-balancer-arn "$alb_arn" \
     --protocol HTTP --port 80 --tags $ELB_TAGS \
-    --default-actions "Type=forward,TargetGroupArn=$tg_arn" >/dev/null
+    --default-actions '[{"Type":"redirect","RedirectConfig":{"Protocol":"HTTPS","Port":"443","StatusCode":"HTTP_301"}}]' >/dev/null
   log "waiting for the load balancer"
   aws elbv2 wait load-balancer-available --region "$REGION" --load-balancer-arns "$alb_arn"
+fi
+
+# --- a certificate of the application's own --------------------------------
+#
+# enclavize's certificate covers dashboard., proof. and apply. — its own names,
+# not this one. So the application asks for its own, and validates it by writing
+# records under app.{domain}: another use of the same carve-out that lets it
+# claim the name at all, and the part of that permission the A record alone
+# never exercises.
+#
+# Reused once issued. Requesting per deploy would leave a trail of certificates
+# and pay the validation wait every time.
+
+cert_arn="$(aws acm list-certificates --region "$REGION" \
+  --query "CertificateSummaryList[?DomainName=='app.$DOMAIN'].CertificateArn|[0]" --output text 2>/dev/null)"
+if [ -z "$cert_arn" ] || [ "$cert_arn" = "None" ]; then
+  cert_arn="$(aws acm request-certificate --region "$REGION" --domain-name "app.$DOMAIN" \
+    --validation-method DNS --tags Key=evize:app,Value=test \
+    --query CertificateArn --output text)"
+  log "requested a certificate for app.$DOMAIN"
+fi
+
+# The validation record only appears once ACM has worked out what it wants.
+for _ in $(seq 1 30); do
+  read -r rr_name rr_type rr_value <<< "$(aws acm describe-certificate --region "$REGION" \
+    --certificate-arn "$cert_arn" \
+    --query 'Certificate.DomainValidationOptions[0].ResourceRecord.[Name,Type,Value]' \
+    --output text 2>/dev/null)"
+  [ -n "$rr_name" ] && [ "$rr_name" != "None" ] && break
+  sleep 5
+done
+
+if [ -n "$ZONE_ID" ] && [ "$ZONE_ID" != "None" ] && [ "$rr_name" != "None" ]; then
+  aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch "{
+    \"Comment\": \"evize-app certificate validation\",
+    \"Changes\": [{\"Action\": \"UPSERT\", \"ResourceRecordSet\": {
+      \"Name\": \"$rr_name\", \"Type\": \"$rr_type\", \"TTL\": 300,
+      \"ResourceRecords\": [{\"Value\": \"$rr_value\"}]}}]
+  }" >/dev/null && log "published the validation record for app.$DOMAIN"
+fi
+
+log "waiting for the certificate"
+aws acm wait certificate-validated --region "$REGION" --certificate-arn "$cert_arn" 2>/dev/null \
+  || log "certificate not validated yet; the HTTPS listener may not come up this deploy"
+
+if ! aws elbv2 describe-listeners --region "$REGION" --load-balancer-arn "$alb_arn" \
+     --query 'Listeners[?Port==`443`]' --output text 2>/dev/null | grep -q .; then
+  aws elbv2 create-listener --region "$REGION" --load-balancer-arn "$alb_arn" \
+    --protocol HTTPS --port 443 --certificates "CertificateArn=$cert_arn" \
+    --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 --tags $ELB_TAGS \
+    --default-actions "Type=forward,TargetGroupArn=$tg_arn" >/dev/null \
+    && log "listening on 443"
 fi
 
 read -r ALB_DNS ALB_ZONE <<< "$(aws elbv2 describe-load-balancers --region "$REGION" \
@@ -278,5 +337,5 @@ if [ -n "$ZONE_ID" ] && [ "$ZONE_ID" != "None" ]; then
   }" >/dev/null && log "app.$DOMAIN -> $ALB_DNS"
 fi
 
-log "done — http://app.$DOMAIN (or http://$ALB_DNS)"
+log "done — https://app.$DOMAIN (or http://$ALB_DNS)"
 log "holes=$HOLES over-restrictions=$BLOCKED"

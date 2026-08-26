@@ -115,6 +115,40 @@ for group_name in "$NAME-instance" "$NAME-alb"; do
   done
 done
 
+# --- the certificate ------------------------------------------------------
+#
+# After the load balancer: ACM refuses to delete a certificate a listener still
+# references. Its validation record goes too — it exists only to keep the
+# certificate renewable, and the certificate is going.
+
+CERT_ARN="$(aws acm list-certificates --region "$REGION" \
+  --query "CertificateSummaryList[?DomainName=='app.$DOMAIN'].CertificateArn|[0]" --output text 2>/dev/null)"
+if gone "$CERT_ARN"; then
+  log "no certificate for app.$DOMAIN"
+else
+  read -r RR_NAME RR_TYPE RR_VALUE <<< "$(aws acm describe-certificate --region "$REGION" \
+    --certificate-arn "$CERT_ARN" \
+    --query 'Certificate.DomainValidationOptions[0].ResourceRecord.[Name,Type,Value]' \
+    --output text 2>/dev/null)"
+
+  for attempt in 1 2 3 4 5 6; do
+    if aws acm delete-certificate --region "$REGION" --certificate-arn "$CERT_ARN" >/dev/null 2>&1; then
+      log "deleted the certificate for app.$DOMAIN"
+      break
+    fi
+    [ "$attempt" = 6 ] && log "could not delete the certificate; still in use"
+    sleep 10
+  done
+
+  if [ -n "${ZONE_ID:-}" ] && ! gone "${ZONE_ID:-}" && ! gone "$RR_NAME"; then
+    aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch "{
+      \"Changes\": [{\"Action\": \"DELETE\", \"ResourceRecordSet\": {
+        \"Name\": \"$RR_NAME\", \"Type\": \"$RR_TYPE\", \"TTL\": 300,
+        \"ResourceRecords\": [{\"Value\": \"$RR_VALUE\"}]}}]
+    }" >/dev/null 2>&1 && log "deleted the validation record" || log "no validation record to delete"
+  fi
+fi
+
 # --- the bucket -----------------------------------------------------------
 
 BUCKET="evize-app-$ACCOUNT"
