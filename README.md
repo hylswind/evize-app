@@ -18,6 +18,18 @@ against a policy document — this is the only place IAM itself answers.
 Green means every forbidden action was refused and every needed one permitted.
 A red **HOLE** row means the boundary allowed something it should not.
 
+Beside the page, `results.json` carries the same probes as data, in the shape
+enclavize's end-to-end suite reads — so a test can assert on the outcome instead
+of scraping the page:
+
+```json
+{"ok": true,
+ "probes": [{"name": "read the proof bucket", "expected": "deny",
+             "verdict": "ok", "detail": "AccessDenied ..."}]}
+```
+
+`ok` is true only when every probe's verdict is `ok`.
+
 ## Probes
 
 Must be refused: reading the proof bucket, writing the dashboard bucket,
@@ -39,7 +51,19 @@ The page being reachable at all is that carve-out working.
 
 ## Cleanup
 
-Everything created here is tagged `evize:app=test`:
+`teardown.sh` removes everything `setup.sh` created. enclavize's own teardown
+handles what enclavize built; only the application knows what the application
+built, which is why this lives here. `tests/e2e/unseal.py` runs it first, while
+the hosted zone still exists for `app.{domain}` to be deleted from.
+
+The order matters and the script keeps it: record, listener, load balancer (wait
+for it to actually disappear), target group, instances, security groups, bucket.
+A security group will not go while anything still references it, and deletion is
+not instant. It is safe to run twice.
+
+Everything created here is tagged `evize:app=test`, and the script ends by
+reporting anything still carrying that tag — which would mean `setup.sh` has
+grown something the teardown does not know about yet:
 
 ```bash
 aws resourcegroupstaggingapi get-resources \
@@ -48,14 +72,11 @@ aws resourcegroupstaggingapi get-resources \
 ```
 
 Route 53 record sets are the exception — AWS allows tags only on hosted zones
-and health checks — so `app.{domain}` has to be deleted by name.
+and health checks — so `app.{domain}` is deleted by name.
 
-Delete in this order, or the security groups will refuse to go: listener, load
-balancer (wait for it to disappear), target group, security groups, buckets.
-
-A genuinely sealed account has no credential that can do any of this, so
-cleanup either goes through another deploy or through a rescue root key kept
-deliberately for the purpose.
+A genuinely sealed account has no credential that can run any of this, so
+cleanup goes either through another applied commit or through a rescue root key
+kept deliberately for the purpose.
 
 ## Redeploying
 

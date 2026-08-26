@@ -161,6 +161,32 @@ HEAD
 FOOT
 } > /usr/share/nginx/html/index.html
 
+# The same probes as machine-readable data, in the shape enclavize's e2e suite
+# reads. The page above is for a person; this is so a test can assert on the
+# result instead of scraping HTML. python3 rather than hand-rolled quoting:
+# `detail` is whatever AWS said, and that contains quotes and backslashes.
+python3 - "$RESULTS" "$ACCOUNT" "$COMMIT" "$INSTANCE_ID" "$DEPLOYED_AT" <<'PY' \
+  > /usr/share/nginx/html/results.json
+import csv, json, sys
+
+path, account, commit, instance, deployed_at = sys.argv[1:6]
+with open(path, newline="") as handle:
+    probes = [
+        {"name": label, "expected": expect, "verdict": verdict, "detail": detail}
+        for verdict, expect, label, detail in csv.reader(handle, delimiter="\t")
+    ]
+
+json.dump({
+    "ok": all(p["verdict"] == "ok" for p in probes),
+    "account": account,
+    "commit": commit,
+    "instance": instance,
+    "deployedAt": deployed_at,
+    "probes": probes,
+}, sys.stdout, indent=2)
+sys.stdout.write("\n")
+PY
+
 systemctl enable --now nginx >/dev/null 2>&1
 log "nginx serving the results"
 
