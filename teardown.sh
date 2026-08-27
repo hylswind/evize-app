@@ -7,14 +7,16 @@
 # tests/e2e/unseal.py before the hosted zone goes, because app.{domain} has to
 # be deleted while there is still a zone to delete it from.
 #
-# Called with ENCLAVIZE_REGION and ENCLAVIZE_DOMAIN set, and credentials that
+# Called with ENCLAVIZE_DOMAIN set, and credentials that
 # can act in the account. Safe to run twice: everything here tolerates its
 # target already being gone.
 
 set -uo pipefail
 
-REGION="${ENCLAVIZE_REGION:-us-east-1}"
+# The same environment setup.sh gets: the domain, and nothing else.
 DOMAIN="${ENCLAVIZE_DOMAIN:-}"
+REGION=us-east-1
+export AWS_DEFAULT_REGION="$REGION"   # for the calls below that take no --region
 NAME=evize-app
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 

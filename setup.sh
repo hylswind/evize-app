@@ -20,9 +20,13 @@
 
 set -uo pipefail
 
-REGION="${ENCLAVIZE_REGION:-us-east-1}"
-COMMIT="${ENCLAVIZE_COMMIT:-unknown}"
+# enclavize hands an application one thing: the domain. Not the region,
+# because enclavize only ever runs in us-east-1; not the commit, because
+# this repo is already checked out at it.
 DOMAIN="${ENCLAVIZE_DOMAIN:-}"
+REGION=us-east-1
+export AWS_DEFAULT_REGION="$REGION"   # for the calls below that take no --region
+COMMIT="$(git rev-parse HEAD)"
 NAME=evize-app
 DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RESULTS=/tmp/probe-results.tsv
