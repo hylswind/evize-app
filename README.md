@@ -1,26 +1,24 @@
 # evize-app
 
-A test application for [enclavize](https://github.com/hylswind/evize-workflow).
+A test application for [enclavize](https://github.com/hylswind/enclavize-workflow).
 
-`setup.sh` at the repo root is the entire contract. The deploy state machine
-launches an instance, clones this repo at a commit, and runs it.
+`setup.sh` at the repo root is the entire contract: when it is ready, it
+listens on port 80 and answers `GET /healthz` with 200. The switch state
+machine launches an instance, clones this repo at a commit, runs the script,
+and once the load balancer in front sees `/healthz` answer, moves
+`https://{domain}` to that instance and retires the one before it.
 
 What it builds:
 
 ```
-app.{domain}  ->  ALB (:443, its own certificate)  ->  an instance running nginx
-                     :80 redirects to :443
+https://{domain}  ->  enclavize's front door (:443, its certificate)  ->  this instance, nginx on :80
 ```
 
-The certificate is the application's own. enclavize's covers `dashboard.`,
-`proof.` and `apply.` — its names, not this one — so HTTPS here means asking
-ACM for a certificate and writing validation records under `app.{domain}`.
-That is the half of the DNS carve-out that claiming the name does not
-exercise: the boundary has to permit `_hash.app.{domain}` as well as
-`app.{domain}`, while still refusing the three names enclavize keeps.
-
-It is requested once and reused. Asking per deploy would leave a trail of
-certificates and pay the validation wait every time.
+Nothing in front of the instance is the application's. The balancer, the
+certificate and the apex record are enclavize's, and one of the things probed
+below is that the instance cannot touch them. Before `/healthz` exists the
+balancer's checks are refused, which is what keeps traffic on the previous
+version until this one is ready.
 
 What the page shows: the result of **probing the permission boundary from inside
 the sealed account**. Everything else asserted about that boundary is asserted
@@ -35,42 +33,49 @@ of scraping the page:
 
 ```json
 {"ok": true,
+ "commit": "473542a6bdbec74ee3b52e8809b034f72b5ba7cf",
+ "version": "2",
+ "replaced": {"commit": "…", "instanceId": "i-…", "since": "…"},
  "probes": [{"name": "read the proof bucket", "expected": "deny",
              "verdict": "ok", "detail": "AccessDenied ..."}]}
 ```
 
-`ok` is true only when every probe's verdict is `ok`.
+`ok` is true only when every probe's verdict is `ok`. `version` is the
+`VERSION` file, so two commits can be told apart by eye once switched; `replaced`
+is what `/enclavize/apply/current` said when this instance started — the version
+this one took over from.
 
 ## Probes
 
 Must be refused: reading the proof bucket, writing the dashboard bucket,
 deleting `enclavize-admin`, unlocking the console, listing registered domains,
-rewriting `proof.{domain}`, creating a role without the boundary.
+rewriting `proof.{domain}`, creating a role without the boundary — and, around
+the switch: repointing the apex, touching the front door, writing
+`/enclavize/apply/pending`, terminating an instance wearing the enclave's name,
+tagging itself with that name.
 
-Must be permitted: creating its own bucket, describing its own instances, using
-Step Functions for itself — the carve-outs that keep the boundary from being
-collateral damage rather than a fence.
+Must be permitted: reading what enclavize says is serving and coming, creating
+its own bucket, describing its own instances, using Step Functions for itself —
+the carve-outs that keep the boundary from being collateral damage rather than
+a fence.
 
 The probes are **real attempts, not policy simulation**. A simulated answer
 models what IAM would decide; an attempt is what IAM did decide. The cost is
 that a broken fence is genuinely breached rather than merely reported — which
 is the right trade in a sacrificial account, where a silent hole is far worse.
+The two probes that could do damage through a hole are shaped not to: the apex
+is written back unchanged, and the terminate is a dry run.
 
-`app.{domain}` is itself a probe: the boundary protects `dashboard.`, `proof.`
-and the apex MX/NS/SOA while leaving the rest of the zone to the application.
-The page being reachable at all is that carve-out working.
+A denial has to look like one. A probe that fails for some other reason — a
+missing resource, a bad argument — is reported **UNCLEAR** and fails the page,
+because it proves nothing about the fence.
 
 ## Cleanup
 
-`teardown.sh` removes everything `setup.sh` created. enclavize's own teardown
-handles what enclavize built; only the application knows what the application
-built, which is why this lives here. `tests/e2e/unseal.py` runs it first, while
-the hosted zone still exists for `app.{domain}` to be deleted from.
-
-The order matters and the script keeps it: record, listener, load balancer (wait
-for it to actually disappear), target group, instances, security groups, bucket.
-A security group will not go while anything still references it, and deletion is
-not instant. It is safe to run twice.
+`teardown.sh` removes what `setup.sh` created and enclavize does not: the
+bucket, and any instance still carrying the app's tag. enclavize's own teardown
+handles the front door and every instance it launched; `tests/e2e/unseal.py`
+runs this first.
 
 Everything created here is tagged `evize:app=test`, and the script ends by
 reporting anything still carrying that tag — which would mean `setup.sh` has
@@ -82,20 +87,13 @@ aws resourcegroupstaggingapi get-resources \
   --query 'ResourceTagMappingList[].ResourceARN'
 ```
 
-Route 53 record sets are the exception — AWS allows tags only on hosted zones
-and health checks — so `app.{domain}` is deleted by name.
-
 A genuinely sealed account has no credential that can run any of this, so
 cleanup goes either through another applied commit or through a rescue root key
 kept deliberately for the purpose.
 
 ## Redeploying
 
-The ALB, target group and certificate are reused rather than rebuilt, so
-`app.{domain}` keeps pointing at the same load balancer and only the registered
-target changes. Each deploy replaces the previous instance in the target group,
-terminates it, and re-runs the probes.
-
-Retiring it is the application's job. enclavize launches one instance per apply
-and hands it over; it has no view on whether a previous one is still wanted, so
-nothing else will stop it. Left alone they accumulate one per commit applied.
+Apply another commit. enclavize launches it behind the front door, waits for
+`/healthz`, switches, and retires this instance. Nothing here has to retire
+anything: the previous version is enclavize's to take out, and it does so only
+after the new one is in.

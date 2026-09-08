@@ -2,14 +2,14 @@
 #
 # Remove everything setup.sh created, so the account can be sealed again.
 #
-# enclavize's own teardown removes what enclavize built; only the application
-# knows what the application built, which is why this lives here. It is run by
-# tests/e2e/unseal.py before the hosted zone goes, because app.{domain} has to
-# be deleted while there is still a zone to delete it from.
+# enclavize's own teardown removes what enclavize built — the front door, and
+# every instance it launched; only the application knows what the application
+# built, which is why this lives here. It is run by tests/e2e/unseal.py after
+# the instances and before the rest.
 #
-# Called with ENCLAVIZE_DOMAIN set, and credentials that
-# can act in the account. Safe to run twice: everything here tolerates its
-# target already being gone.
+# Called with ENCLAVIZE_DOMAIN set, and credentials that can act in the
+# account. Safe to run twice: everything here tolerates its target already
+# being gone.
 
 set -uo pipefail
 
@@ -17,68 +17,18 @@ set -uo pipefail
 DOMAIN="${ENCLAVIZE_DOMAIN:-}"
 REGION=us-east-1
 export AWS_DEFAULT_REGION="$REGION"   # for the calls below that take no --region
-NAME=evize-app
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 
 log() { echo "[teardown] $*"; }
-gone() { [ -z "$1" ] || [ "$1" = "None" ]; }
 
 log "account=$ACCOUNT region=$REGION domain=${DOMAIN:-<unset>}"
 
-# --- app.{domain} ---------------------------------------------------------
-#
-# By name, not by tag: Route 53 only allows tags on hosted zones and health
-# checks, never on record sets.
-
-if [ -n "$DOMAIN" ]; then
-  ZONE_ID="$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" \
-    --query 'HostedZones[0].Id' --output text 2>/dev/null | sed 's|/hostedzone/||')"
-  if ! gone "$ZONE_ID"; then
-    RECORD="$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE_ID" \
-      --query "ResourceRecordSets[?Name=='app.$DOMAIN.']|[0]" --output json 2>/dev/null)"
-    if [ -n "$RECORD" ] && [ "$RECORD" != "null" ]; then
-      aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" \
-        --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":$RECORD}]}" \
-        >/dev/null 2>&1 && log "deleted app.$DOMAIN" || log "could not delete app.$DOMAIN"
-    else
-      log "no app.$DOMAIN record"
-    fi
-  fi
-fi
-
-# --- the load balancer ----------------------------------------------------
-#
-# Listeners, then the balancer, then a wait. The security groups below cannot
-# go while anything still references them, and deletion is not instant.
-
-ALB_ARN="$(aws elbv2 describe-load-balancers --region "$REGION" --names "$NAME" \
-  --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null)"
-if gone "$ALB_ARN"; then
-  log "no load balancer"
-else
-  for listener in $(aws elbv2 describe-listeners --region "$REGION" \
-      --load-balancer-arn "$ALB_ARN" --query 'Listeners[].ListenerArn' --output text 2>/dev/null); do
-    aws elbv2 delete-listener --region "$REGION" --listener-arn "$listener" >/dev/null 2>&1
-  done
-  aws elbv2 delete-load-balancer --region "$REGION" --load-balancer-arn "$ALB_ARN" >/dev/null 2>&1
-  log "deleting the load balancer; waiting for it to go"
-  aws elbv2 wait load-balancers-deleted --region "$REGION" --load-balancer-arns "$ALB_ARN" 2>/dev/null
-  log "load balancer gone"
-fi
-
-TG_ARN="$(aws elbv2 describe-target-groups --region "$REGION" --names "$NAME" \
-  --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null)"
-if gone "$TG_ARN"; then
-  log "no target group"
-else
-  aws elbv2 delete-target-group --region "$REGION" --target-group-arn "$TG_ARN" >/dev/null 2>&1 \
-    && log "deleted target group $NAME" || log "could not delete target group"
-fi
-
 # --- instances ------------------------------------------------------------
 #
-# Before the security groups: one is attached to every instance this app
-# deployed, and an attached group cannot be deleted.
+# enclavize retires each version as the next one is switched in, and its own
+# teardown terminates whatever it launched. This catches anything still
+# carrying the app's tag regardless — a version that never became healthy,
+# say — and waits, because nothing behind it can go while it holds a group.
 
 INSTANCES="$(aws ec2 describe-instances --region "$REGION" \
   --filters "Name=tag:evize:app,Values=test" \
@@ -91,64 +41,6 @@ if [ -n "$INSTANCES" ]; then
   log "instances terminated"
 else
   log "no tagged instances"
-fi
-
-# --- security groups ------------------------------------------------------
-#
-# Last, and retried: a group stays undeletable for a while after the things
-# referencing it are gone, and the instance group is referenced by the ALB
-# group's rules.
-
-for group_name in "$NAME-instance" "$NAME-alb"; do
-  gid="$(aws ec2 describe-security-groups --region "$REGION" \
-    --filters "Name=group-name,Values=$group_name" \
-    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)"
-  if gone "$gid"; then
-    log "no security group $group_name"
-    continue
-  fi
-  for attempt in 1 2 3 4 5 6; do
-    if aws ec2 delete-security-group --region "$REGION" --group-id "$gid" >/dev/null 2>&1; then
-      log "deleted security group $group_name"
-      break
-    fi
-    [ "$attempt" = 6 ] && log "could not delete security group $group_name ($gid); still in use"
-    sleep 10
-  done
-done
-
-# --- the certificate ------------------------------------------------------
-#
-# After the load balancer: ACM refuses to delete a certificate a listener still
-# references. Its validation record goes too — it exists only to keep the
-# certificate renewable, and the certificate is going.
-
-CERT_ARN="$(aws acm list-certificates --region "$REGION" \
-  --query "CertificateSummaryList[?DomainName=='app.$DOMAIN'].CertificateArn|[0]" --output text 2>/dev/null)"
-if gone "$CERT_ARN"; then
-  log "no certificate for app.$DOMAIN"
-else
-  read -r RR_NAME RR_TYPE RR_VALUE <<< "$(aws acm describe-certificate --region "$REGION" \
-    --certificate-arn "$CERT_ARN" \
-    --query 'Certificate.DomainValidationOptions[0].ResourceRecord.[Name,Type,Value]' \
-    --output text 2>/dev/null)"
-
-  for attempt in 1 2 3 4 5 6; do
-    if aws acm delete-certificate --region "$REGION" --certificate-arn "$CERT_ARN" >/dev/null 2>&1; then
-      log "deleted the certificate for app.$DOMAIN"
-      break
-    fi
-    [ "$attempt" = 6 ] && log "could not delete the certificate; still in use"
-    sleep 10
-  done
-
-  if [ -n "${ZONE_ID:-}" ] && ! gone "${ZONE_ID:-}" && ! gone "$RR_NAME"; then
-    aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch "{
-      \"Changes\": [{\"Action\": \"DELETE\", \"ResourceRecordSet\": {
-        \"Name\": \"$RR_NAME\", \"Type\": \"$RR_TYPE\", \"TTL\": 300,
-        \"ResourceRecords\": [{\"Value\": \"$RR_VALUE\"}]}}]
-    }" >/dev/null 2>&1 && log "deleted the validation record" || log "no validation record to delete"
-  fi
 fi
 
 # --- the bucket -----------------------------------------------------------
