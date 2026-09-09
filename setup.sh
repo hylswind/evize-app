@@ -36,6 +36,21 @@ WEB=/usr/share/nginx/html
 log() { echo "[app] $*"; }
 : > "$RESULTS"
 
+# --- a CLI that knows every service it is asked about -----------------------
+#
+# The probes below are only as good as the CLI running them. The one the image
+# ships lags the newer services — it has never heard of `signin` — and a
+# command the CLI refuses to parse never reaches IAM, so it proves nothing
+# about the boundary. The current release, installed the way AWS documents.
+
+dnf install -y unzip >/dev/null 2>&1
+curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip \
+  && unzip -qo /tmp/awscliv2.zip -d /tmp \
+  && /tmp/aws/install --update >/dev/null 2>&1
+export PATH=/usr/local/bin:$PATH
+hash -r
+log "aws cli: $(aws --version 2>&1)"
+
 # --- who and where are we -------------------------------------------------
 
 TOKEN="$(curl -sX PUT http://169.254.169.254/latest/api/token \
