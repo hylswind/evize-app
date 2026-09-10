@@ -1,13 +1,23 @@
 #!/bin/bash
 #
 # The whole contract enclavize requires of an application: an executable
-# setup.sh at the repo root. The deploy state machine launches an instance,
-# clones this repo at a commit, and runs this.
+# setup.sh at the repo root. The apply state machine launches an instance,
+# clones this repo at a commit, and runs this — in one of two modes.
 #
-# This one serves a page over HTTPS, behind an ALB, at app.{domain} — and what
-# the page shows is the result of probing the permission boundary from inside
-# the sealed account. Everything asserted about that boundary elsewhere is
-# asserted against a policy document; this is the only place IAM itself answers.
+#   NEW     this instance is the version that will serve. Build, probe, serve.
+#   UPDATE  this instance is the version serving now, run once more to prepare
+#           for the commit named in ENCLAVIZE_NEXT_COMMIT. Do what a handover
+#           needs, say ready, and shut down; enclavize launches the new commit
+#           once it has heard.
+#
+# In NEW mode this serves a page over HTTPS, behind an ALB of its own, at
+# app.{domain} — and what the page shows is the result of probing the
+# permission boundary from inside the sealed account. Everything asserted
+# about that boundary elsewhere is asserted against a policy document; this is
+# the only place IAM itself answers.
+#
+# In UPDATE mode it leaves a handover note in the app's own bucket, which the
+# version coming in shows: the stand-in for warning customers and moving data.
 #
 # The certificate is the application's own. enclavize's covers dashboard.,
 # proof. and apply. — its names, not this one — so getting HTTPS at all means
@@ -20,19 +30,40 @@
 
 set -uo pipefail
 
-# enclavize hands an application one thing: the domain. Not the region,
-# because enclavize only ever runs in us-east-1; not the commit, because
-# this repo is already checked out at it.
+# What enclavize hands an application: the domain, which mode this is, and —
+# only when preparing — the commit coming next. Not the region, because
+# enclavize only ever runs in us-east-1; not this commit, because the repo is
+# already checked out at it.
 DOMAIN="${ENCLAVIZE_DOMAIN:-}"
+MODE="${ENCLAVIZE_MODE:-NEW}"
+NEXT="${ENCLAVIZE_NEXT_COMMIT:-}"
 REGION=us-east-1
 export AWS_DEFAULT_REGION="$REGION"   # for the calls below that take no --region
 COMMIT="$(git rev-parse HEAD)"
+VERSION="$(cat VERSION 2>/dev/null || echo unknown)"
 NAME=evize-app
 DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RESULTS=/tmp/probe-results.tsv
+WEB=/usr/share/nginx/html
+READY_PARAM=/enclavize/apply/ready
 
 log() { echo "[app] $*"; }
 : > "$RESULTS"
+
+# --- a CLI that knows every service it is asked about -----------------------
+#
+# The probes below are only as good as the CLI running them. The one the image
+# ships lags the newer services — it has never heard of `signin` — and a
+# command the CLI refuses to parse never reaches IAM, so it proves nothing
+# about the boundary. The current release, installed the way AWS documents.
+
+dnf install -y unzip >/dev/null 2>&1
+curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip \
+  && unzip -qo /tmp/awscliv2.zip -d /tmp \
+  && /tmp/aws/install --update >/dev/null 2>&1
+export PATH=/usr/local/bin:$PATH
+hash -r
+log "aws cli: $(aws --version 2>&1)"
 
 # --- who and where are we -------------------------------------------------
 
@@ -43,11 +74,57 @@ INSTANCE_ID="$(imds instance-id)"
 VPC_ID="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
            --query 'Reservations[0].Instances[0].VpcId' --output text)"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+BUCKET="evize-app-$ACCOUNT"
 
-log "account=$ACCOUNT instance=$INSTANCE_ID vpc=$VPC_ID commit=$COMMIT"
+log "account=$ACCOUNT instance=$INSTANCE_ID vpc=$VPC_ID commit=$COMMIT version=$VERSION mode=$MODE next=${NEXT:-none}"
 
 TAGS="Key=evize:app,Value=test Key=evize:commit,Value=$COMMIT Key=evize:deployed-at,Value=$DEPLOYED_AT"
 ELB_TAGS="Key=evize:app,Value=test Key=evize:commit,Value=$COMMIT"
+
+# --- UPDATE: prepare for what is coming, say ready, go ----------------------
+#
+# This instance is the serving version run again, not the new one. A real
+# application would warn its users and move its data here; this one leaves a
+# note for the version coming in, in the bucket the serving version made.
+#
+# The word is the commit it was told about, not "ok": enclavize counts it only
+# when it names the commit that is waiting, so a preparer that speaks late —
+# after its apply was superseded — cannot let a later commit through early.
+#
+# Then shutdown. The instance was launched to terminate when it does, and
+# there is nothing to keep.
+
+if [ "$MODE" = UPDATE ]; then
+  aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1 || true
+  python3 - "$COMMIT" "$NEXT" "$VERSION" "$INSTANCE_ID" "$DEPLOYED_AT" <<'PY' > /tmp/handover.json
+import json, sys
+commit, nxt, version, instance, at = sys.argv[1:6]
+json.dump({"from": commit, "fromVersion": version, "to": nxt, "preparedAt": at, "preparer": instance},
+          sys.stdout, indent=2)
+sys.stdout.write("\n")
+PY
+  aws s3 cp /tmp/handover.json "s3://$BUCKET/handover.json" >/dev/null \
+    && log "left a handover note for $NEXT" \
+    || log "could not write the handover note"
+
+  if aws ssm put-parameter --name "$READY_PARAM" --value "$NEXT" --type String --overwrite >/dev/null; then
+    log "said ready for $NEXT"
+  else
+    log "could not say ready; enclavize will switch when its wait is up"
+  fi
+  log "shutting down"
+  shutdown -h now
+  exit 0
+fi
+
+# --- NEW: the version that will serve ---------------------------------------
+
+# The note the preparer left, if this is the commit it was preparing for.
+HANDOVER="$(aws s3 cp "s3://$BUCKET/handover.json" - 2>/dev/null || echo "")"
+if [ -n "$HANDOVER" ] && ! echo "$HANDOVER" | grep -q "\"to\": \"$COMMIT\""; then
+  HANDOVER=""
+fi
+log "handover note: ${HANDOVER:+present}${HANDOVER:-none}"
 
 # --- probe the boundary ---------------------------------------------------
 #
@@ -55,14 +132,22 @@ ELB_TAGS="Key=evize:app,Value=test Key=evize:commit,Value=$COMMIT"
 # would decide; an attempt is what IAM did decide. The cost is that a broken
 # fence is actually breached rather than merely reported — acceptable in a
 # sacrificial account, where a silent hole is the worse outcome by far.
+#
+# A denial has to look like one. A command that fails for some other reason —
+# a thing that does not exist, a bad argument — proves nothing about the
+# fence, and is reported as UNCLEAR rather than counted as refused.
 
 probe() {                       # probe <expectation> <label> <command...>
   local expect="$1" label="$2"; shift 2
   local output verdict
-  if output="$("$@" 2>&1)"; then
+  # A dry run that would have gone ahead fails too, with DryRunOperation —
+  # which for the purpose here is the call being allowed.
+  if output="$("$@" 2>&1)" || echo "$output" | grep -q DryRunOperation; then
     [ "$expect" = allow ] && verdict=ok || verdict=HOLE
-  else
+  elif echo "$output" | grep -qE 'AccessDenied|UnauthorizedOperation|not authorized'; then
     [ "$expect" = deny ] && verdict=ok || verdict=BLOCKED
+  else
+    verdict=UNCLEAR
   fi
   printf '%s\t%s\t%s\t%s\n' "$verdict" "$expect" "$label" \
     "$(echo "$output" | tr '\n' ' ' | cut -c1-160)" >> "$RESULTS"
@@ -90,15 +175,31 @@ probe deny "create an unbounded role" \
   aws iam create-role --role-name evize-app-escape \
     --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
+# The handover, which an applied version must not be able to work around:
+# the bookkeeping it may neither read nor write, the timer, and the check.
+probe deny "read what enclavize says is serving" \
+  aws ssm get-parameter --name /enclavize/apply/current
+probe deny "read the go flag" \
+  aws ssm get-parameter --name /enclavize/go-flag
+probe deny "tell enclavize what is coming" \
+  aws ssm put-parameter --name /enclavize/apply/pending --value hijacked --type String --overwrite
+probe deny "take down the check timer" \
+  aws scheduler delete-schedule --name enclavize-apply-check
+probe deny "start the check by hand" \
+  aws stepfunctions start-execution \
+    --state-machine-arn "arn:aws:states:$REGION:$ACCOUNT:stateMachine:enclavize-apply-check"
+
 # Things the application legitimately needs.
 probe allow "create my own bucket" \
-  aws s3api create-bucket --bucket "evize-app-$ACCOUNT" --region "$REGION"
+  aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
 probe allow "describe my own instances" \
   aws ec2 describe-instances --region "$REGION"
 probe allow "use step functions for myself" \
   aws stepfunctions list-state-machines --region "$REGION"
+probe allow "keep timers of my own" \
+  aws scheduler list-schedules --region "$REGION"
 
-aws s3api put-bucket-tagging --bucket "evize-app-$ACCOUNT" \
+aws s3api put-bucket-tagging --bucket "$BUCKET" \
   --tagging "TagSet=[{Key=evize:app,Value=test},{Key=evize:commit,Value=$COMMIT}]" 2>/dev/null || true
 
 # --- serve the results ----------------------------------------------------
@@ -107,6 +208,7 @@ log "installing nginx"
 dnf install -y nginx >/dev/null 2>&1
 HOLES="$(grep -c $'^HOLE\t' "$RESULTS" || true)"
 BLOCKED="$(grep -c $'^BLOCKED\t' "$RESULTS" || true)"
+UNCLEAR="$(grep -c $'^UNCLEAR\t' "$RESULTS" || true)"
 
 {
   cat <<'HEAD'
@@ -129,6 +231,7 @@ BLOCKED="$(grep -c $'^BLOCKED\t' "$RESULTS" || true)"
   th { text-align:left; font-weight:600; opacity:.6; padding:.5rem .6rem; border-bottom:1px solid var(--line); }
   td { padding:.55rem .6rem; border-bottom:1px solid var(--line); vertical-align:top; }
   .ok { color:#0a7; } .hole { color:#e33; font-weight:700; } .blocked { color:#c80; font-weight:700; }
+  .unclear { color:#c80; }
   .why { opacity:.5; font-size:.8rem; font-family:ui-monospace, monospace; }
   dl { display:grid; grid-template-columns:auto 1fr; gap:.3rem 1rem; font-size:.85rem; opacity:.7; margin-top:2.5rem; }
   dt { font-weight:600; }
@@ -137,13 +240,15 @@ BLOCKED="$(grep -c $'^BLOCKED\t' "$RESULTS" || true)"
 <main>
 HEAD
 
-  echo "<h1>permission boundary</h1>"
+  echo "<h1>permission boundary · version $VERSION</h1>"
   echo "<p class=sub>probed from inside the sealed account, by the application itself</p>"
 
   if [ "$HOLES" -gt 0 ]; then
     echo "<div class='verdict fail'>$HOLES hole(s): the boundary permitted something it should refuse.</div>"
   elif [ "$BLOCKED" -gt 0 ]; then
     echo "<div class='verdict fail'>$BLOCKED over-restriction(s): the application was denied something it needs.</div>"
+  elif [ "$UNCLEAR" -gt 0 ]; then
+    echo "<div class='verdict fail'>$UNCLEAR probe(s) failed for a reason that says nothing about the boundary.</div>"
   else
     echo "<div class='verdict pass'>The boundary held. Everything forbidden was refused; everything needed was permitted.</div>"
   fi
@@ -154,6 +259,7 @@ HEAD
       ok)      cls=ok;      word=$([ "$expect" = deny ] && echo "denied" || echo "allowed") ;;
       HOLE)    cls=hole;    word="ALLOWED — HOLE" ;;
       BLOCKED) cls=blocked; word="DENIED — too strict" ;;
+      UNCLEAR) cls=unclear; word="failed — not a denial" ;;
     esac
     echo "<tr><td>$label</td><td>$expect</td><td class=$cls>$word</td><td class=why>$(echo "$detail" | sed 's/&/\&amp;/g; s/</\&lt;/g')</td></tr>"
   done < "$RESULTS"
@@ -162,23 +268,25 @@ HEAD
   cat <<FOOT
 <dl>
   <dt>account</dt><dd>$ACCOUNT</dd>
+  <dt>version</dt><dd>$VERSION</dd>
   <dt>commit</dt><dd>$COMMIT</dd>
   <dt>instance</dt><dd>$INSTANCE_ID</dd>
   <dt>deployed</dt><dd>$DEPLOYED_AT</dd>
+  <dt>handed over</dt><dd>$(echo "${HANDOVER:-first version: nothing to hand over}" | tr -d '\n' | sed 's/&/\&amp;/g; s/</\&lt;/g')</dd>
 </dl>
 </main>
 FOOT
-} > /usr/share/nginx/html/index.html
+} > "$WEB/index.html"
 
 # The same probes as machine-readable data, in the shape enclavize's e2e suite
 # reads. The page above is for a person; this is so a test can assert on the
 # result instead of scraping HTML. python3 rather than hand-rolled quoting:
 # `detail` is whatever AWS said, and that contains quotes and backslashes.
-python3 - "$RESULTS" "$ACCOUNT" "$COMMIT" "$INSTANCE_ID" "$DEPLOYED_AT" <<'PY' \
-  > /usr/share/nginx/html/results.json
+python3 - "$RESULTS" "$ACCOUNT" "$COMMIT" "$VERSION" "$INSTANCE_ID" "$DEPLOYED_AT" "$HANDOVER" <<'PY' \
+  > "$WEB/results.json"
 import csv, json, sys
 
-path, account, commit, instance, deployed_at = sys.argv[1:6]
+path, account, commit, version, instance, deployed_at, handover = sys.argv[1:8]
 with open(path, newline="") as handle:
     probes = [
         {"name": label, "expected": expect, "verdict": verdict, "detail": detail}
@@ -189,8 +297,10 @@ json.dump({
     "ok": all(p["verdict"] == "ok" for p in probes),
     "account": account,
     "commit": commit,
+    "version": version,
     "instance": instance,
     "deployedAt": deployed_at,
+    "handover": json.loads(handover) if handover else None,
     "probes": probes,
 }, sys.stdout, indent=2)
 sys.stdout.write("\n")
@@ -249,22 +359,23 @@ if [ -z "$tg_arn" ] || [ "$tg_arn" = "None" ]; then
     --query 'TargetGroups[0].TargetGroupArn' --output text)"
 fi
 
-# This deploy's instance replaces the last one's, and the last one goes.
+# This version's instance replaces the last one's, and the last one goes.
 #
-# enclavize launches one instance per apply and hands it over; what becomes of
-# the previous one is the application's call, and nothing else will make it.
-# Left alone they accumulate — one more running instance per commit applied,
-# each still holding the security group this script wants to delete later.
+# enclavize launches the new commit once the preparer has spoken and hands it
+# over; what becomes of the version that was serving is the application's
+# call, and nothing else will make it. Left alone they accumulate — one more
+# running instance per commit applied, each still holding the security group
+# this script wants to delete later.
 #
 # A real deployment would drain connections first. There is nothing here worth
-# draining.
+# draining — the preparer already did whatever a handover needed.
 for old in $(aws elbv2 describe-target-health --region "$REGION" --target-group-arn "$tg_arn" \
               --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null); do
   if [ "$old" != "$INSTANCE_ID" ]; then
     aws elbv2 deregister-targets --region "$REGION" \
       --target-group-arn "$tg_arn" --targets "Id=$old" >/dev/null 2>&1
     aws ec2 terminate-instances --region "$REGION" --instance-ids "$old" >/dev/null 2>&1 \
-      && log "retired $old, which this deploy replaces"
+      && log "retired $old, which this version replaces"
   fi
 done
 aws elbv2 register-targets --region "$REGION" --target-group-arn "$tg_arn" \
@@ -354,4 +465,4 @@ if [ -n "$ZONE_ID" ] && [ "$ZONE_ID" != "None" ]; then
 fi
 
 log "done — https://app.$DOMAIN (or http://$ALB_DNS)"
-log "holes=$HOLES over-restrictions=$BLOCKED"
+log "holes=$HOLES over-restrictions=$BLOCKED unclear=$UNCLEAR"

@@ -2,10 +2,28 @@
 
 A test application for [enclavize](https://github.com/hylswind/evize-workflow).
 
-`setup.sh` at the repo root is the entire contract. The deploy state machine
-launches an instance, clones this repo at a commit, and runs it.
+`setup.sh` at the repo root is the entire contract. The apply state machine
+launches an instance, clones this repo at a commit, and runs it — in one of
+two modes, named in `ENCLAVIZE_MODE`.
 
-What it builds:
+**`NEW`**: this instance is the version that will serve. It builds what is
+below, probes the boundary, and retires the version before it.
+
+**`UPDATE`**: this instance is the version serving *now*, run once more to
+prepare for the commit named in `ENCLAVIZE_NEXT_COMMIT`. A real application
+would warn its users and move its data; this one leaves a handover note in its
+own bucket, which the version coming in shows on its page and in
+`results.json`. Then it says ready and shuts down:
+
+```sh
+aws ssm put-parameter --name /enclavize/apply/ready \
+  --value "$ENCLAVIZE_NEXT_COMMIT" --type String --overwrite
+shutdown -h now
+```
+
+enclavize launches the new commit, in `NEW` mode, once it has heard.
+
+What `NEW` builds:
 
 ```
 app.{domain}  ->  ALB (:443, its own certificate)  ->  an instance running nginx
@@ -45,11 +63,15 @@ of scraping the page:
 
 Must be refused: reading the proof bucket, writing the dashboard bucket,
 deleting `enclavize-admin`, unlocking the console, listing registered domains,
-rewriting `proof.{domain}`, creating a role without the boundary.
+rewriting `proof.{domain}`, creating a role without the boundary — and, around
+the handover, reading what enclavize says is serving, reading the go flag,
+writing what is coming, taking down the check timer, and starting the check
+by hand.
 
 Must be permitted: creating its own bucket, describing its own instances, using
-Step Functions for itself — the carve-outs that keep the boundary from being
-collateral damage rather than a fence.
+Step Functions and Scheduler for itself — the carve-outs that keep the boundary
+from being collateral damage rather than a fence. Saying ready is permitted
+too, and is exercised for real rather than probed: the `UPDATE` run writes it.
 
 The probes are **real attempts, not policy simulation**. A simulated answer
 models what IAM would decide; an attempt is what IAM did decide. The cost is
@@ -91,11 +113,18 @@ kept deliberately for the purpose.
 
 ## Redeploying
 
+A second apply does not launch the new commit straight away. enclavize runs the
+serving commit again, in `UPDATE` mode, and launches the new one only once that
+run has said ready — or once its wait is up. The new commit's `NEW` run then
+finds the handover note the preparer left.
+
 The ALB, target group and certificate are reused rather than rebuilt, so
 `app.{domain}` keeps pointing at the same load balancer and only the registered
-target changes. Each deploy replaces the previous instance in the target group,
-terminates it, and re-runs the probes.
+target changes. Each version replaces the previous instance in the target
+group, terminates it, and re-runs the probes.
 
-Retiring it is the application's job. enclavize launches one instance per apply
-and hands it over; it has no view on whether a previous one is still wanted, so
+Retiring it is the application's job. enclavize launches the new version and
+hands it over; it has no view on whether a previous one is still wanted, so
 nothing else will stop it. Left alone they accumulate one per commit applied.
+The preparer needs no retiring: it is launched to terminate on shutdown, and
+shutting down is its last act.
